@@ -214,6 +214,10 @@ class CircularBuffer:
         if self._cfg.policy.use_image_augmentations:
             # TODO:
             ## Add image Augmentations to improve performance
+            # For baseline, keep it simple (no aug).
+            transform_crop_scale = v2.Compose([
+                v2.ToDtype(torch.float32),
+            ])
         else:
             transform_crop_scale = v2.Compose([
                 v2.ToDtype(torch.float32) # Convert to float [0,1] after crop/resize
@@ -239,11 +243,28 @@ class CircularBuffer:
         x_goal_img = x_goal_img.permute(0, 2, 3, 1) # Convert to [B, H, W, C] format from torchvision.
         # TODO: 
         ## Provide the block masking logic for the attention head
-        y = 0 ## discrete or continuous actions
-        if cfg.policy.action_stacking > 1:
-            ## Stack the next cfg.policy.action_stacking actions together
-            for i in range(1, cfg.policy.action_stacking): ## This is slow but works.
-                y = torch.concatenate((y, self._model.encode_action(data["action"][ix +cfg.policy.obs_stacking - 1 +i])), axis=1) ## stack on time timension. 
+        # y = 0 ## discrete or continuous actions
+        # if cfg.policy.action_stacking > 1:
+        #     ## Stack the next cfg.policy.action_stacking actions together
+        #     for i in range(1, cfg.policy.action_stacking): ## This is slow but works.
+        #         y = torch.concatenate((y, self._model.encode_action(data["action"][ix +cfg.policy.obs_stacking - 1 +i])), axis=1) ## stack on time timension. 
+        # return x, pose, x_goal, x_goal_img, y
+        
+        # ----------------------------
+        # Targets y (continuous baseline):
+        # predict next action(s) after the last stacked observation frame
+        # ----------------------------
+        base_t = ix + (cfg.policy.obs_stacking - 1)
+
+        y_list = []
+        for k in range(cfg.policy.action_stacking):
+            a = data["action"][base_t + k].to(torch.float32)  # (B, action_dim)
+            a = self._model.encode_action(a)                  # normalize
+            y_list.append(a)
+
+        # (B, action_dim * action_stacking)
+        y = torch.cat(y_list, dim=1)
+
         return x, pose, x_goal, x_goal_img, y
     
     def shuffle(self, shared_queue):
