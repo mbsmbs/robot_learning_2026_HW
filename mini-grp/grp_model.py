@@ -210,16 +210,16 @@ class GRP(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, images, goals_txt, goal_imgs, targets=None, pose=None, mask_=False):
-        n, c, h, w = images.shape
-        obs_patches = get_patches_fast(images, self._cfg)
-        patches_g = get_patches_fast(goal_imgs, self._cfg)
-        if self._cfg.dataset.encode_with_t5:
-            goals_e = goals_txt
-            B, T, E = goals_txt.shape
-        else:
-            goals_e = self.token_embedding_table(goals_txt)
-            B, E = goals_txt.shape
-            T = self._cfg.max_block_size
+        # n, c, h, w = images.shape
+        # obs_patches = get_patches_fast(images, self._cfg)
+        # patches_g = get_patches_fast(goal_imgs, self._cfg)
+        # if self._cfg.dataset.encode_with_t5:
+        #     goals_e = goals_txt
+        #     B, T, E = goals_txt.shape
+        # else:
+        #     goals_e = self.token_embedding_table(goals_txt)
+        #     B, E = goals_txt.shape
+        #     T = self._cfg.max_block_size
 
         # TODO: 
         ## Provide the logic to produce the output and loss for the GRP
@@ -237,6 +237,154 @@ class GRP(nn.Module):
         # Getting the classification token only
 
         # Compute output and loss
+        """
+        images:    usually (B, C, H, W) from the buffer/trainer
+        goal_imgs: usually (B, C, H, W)
+        goals_txt: either
+            - (B, T) token ids (non-T5), OR
+            - (B, T, E_t5) embeddings (T5 mode)
+        targets:   (B, action_dim * action_stacking) for continuous baseline
+        pose:      optional (B, pose_dim)
+        mask_:     whether to apply block masking (drop text or goal image tokens)
+        """
+
+        # ----------------------------
+        # 1) Ensure images are NHWC for get_patches_fast()
+        # ----------------------------
+        # get_patches_fast expects (B, H, W, C)
+        if images.dim() == 4 and images.shape[1] in (3, 3 * self._cfg.policy.obs_stacking):
+            images_nhwc = images.permute(0, 2, 3, 1).contiguous()   # NCHW -> NHWC
+        else:
+            images_nhwc = images
+
+        if goal_imgs.dim() == 4 and goal_imgs.shape[1] == 3:
+            goal_imgs_nhwc = goal_imgs.permute(0, 2, 3, 1).contiguous()
+        else:
+            goal_imgs_nhwc = goal_imgs
+
+        B = images_nhwc.shape[0]
+
+        # ----------------------------
+        # 2) Patchify + project patches to n_embd
+        # ----------------------------
+        obs_patches = get_patches_fast(images_nhwc, self._cfg)        # (B, Nobs, patch_dim)
+        goal_patches = get_patches_fast(goal_imgs_nhwc, self._cfg)    # (B, Ngoal, patch_dim)
+
+        obs_tok = self.obs_patch_proj(obs_patches)                    # (B, Nobs, n_embd)
+        goal_img_tok = self.goal_patch_proj(goal_patches)             # (B, Ngoal, n_embd)
+
+        # ----------------------------
+        # 3) Text tokens
+        # ----------------------------
+        if self._cfg.dataset.encode_with_t5:
+            # goals_txt expected (B, T, E_t5)
+            if goals_txt.dim() != 3:
+                raise ValueError(f"Expected T5 embeddings (B,T,E), got {goals_txt.shape}")
+            text_tok = self.t5_proj(goals_txt)                        # (B, T, n_embd)
+            T_text = text_tok.shape[1]
+            # pad/truncate to max_block_size
+            if T_text < self._cfg.max_block_size:
+                pad_len = self._cfg.max_block_size - T_text
+                pad = torch.zeros(B, pad_len, self._cfg.n_embd, device=text_tok.device, dtype=text_tok.dtype)
+                text_tok = torch.cat([text_tok, pad], dim=1)
+            else:
+                text_tok = text_tok[:, :self._cfg.max_block_size, :]
+        else:
+            # goals_txt expected (B, T) token ids
+            if goals_txt.dim() != 2:
+                raise ValueError(f"Expected token ids (B,T), got {goals_txt.shape}")
+            text_tok = self.token_embedding_table(goals_txt)          # (B, T, n_embd)
+            # ensure fixed length
+            if text_tok.shape[1] != self._cfg.max_block_size:
+                text_tok = text_tok[:, :self._cfg.max_block_size, :]
+
+        # ----------------------------
+        # 4) Special tokens: CLS (+ optional pose)
+        # ----------------------------
+        cls = self.cls_token.expand(B, 1, self._cfg.n_embd)           # (B, 1, n_embd)
+
+        pose_tok = None
+        if pose is not None and hasattr(self, "pose_proj") and self.pose_proj is not None:
+            pose_tok = self.pose_proj(pose).unsqueeze(1)             # (B, 1, n_embd)
+
+        # ----------------------------
+        # 5) Concatenate into one sequence
+        #    [CLS] + [POSE?] + OBS + TEXT + GOAL_IMG
+        # ----------------------------
+        parts = [cls]
+        if pose_tok is not None:
+            parts.append(pose_tok)
+        parts.extend([obs_tok, text_tok, goal_img_tok])
+
+        x = torch.cat(parts, dim=1)                                  # (B, Ttot, n_embd)
+        Ttot = x.shape[1]
+
+        # ----------------------------
+        # 6) Positional embedding + dropout
+        # ----------------------------
+        if Ttot > self.pos_embedding.shape[1]:
+            raise ValueError(f"Sequence too long: {Ttot} > max_seq_len {self.pos_embedding.shape[1]}")
+
+        x = x + self.pos_embedding[:, :Ttot, :].to(x.device)
+        x = self.drop(x)
+
+        # ----------------------------
+        # 7) Block masking (optional)
+        #    Randomly drop TEXT tokens or GOAL_IMG tokens (per sample)
+        # ----------------------------
+        attn_mask = None
+        if mask_:
+            keep = torch.ones(B, Ttot, device=x.device, dtype=torch.bool)
+
+            idx = 0
+            idx += 1  # CLS
+
+            if pose_tok is not None:
+                idx += 1  # POSE
+
+            n_obs = obs_tok.shape[1]
+            obs_start, obs_end = idx, idx + n_obs
+            idx = obs_end
+
+            text_start, text_end = idx, idx + self._cfg.max_block_size
+            idx = text_end
+
+            n_goal = goal_img_tok.shape[1]
+            goal_start, goal_end = idx, idx + n_goal
+
+            # 0 -> drop text, 1 -> drop goal image
+            drop_choice = torch.randint(0, 2, (B,), device=x.device)
+
+            for b in range(B):
+                if drop_choice[b].item() == 0:
+                    keep[b, text_start:text_end] = False
+                    x[b, text_start:text_end, :] = 0.0
+                else:
+                    keep[b, goal_start:goal_end] = False
+                    x[b, goal_start:goal_end, :] = 0.0
+
+            # attention mask: allow attention only between kept tokens
+            attn_mask = keep[:, :, None] & keep[:, None, :]          # (B, T, T)
+
+        # ----------------------------
+        # 8) Transformer encoder blocks
+        # ----------------------------
+        for blk in self.blocks:
+            x = blk(x, mask=attn_mask)
+        x = self.ln_f(x)
+
+        # ----------------------------
+        # 9) Prediction head (use CLS token)
+        # ----------------------------
+        cls_out = x[:, 0, :]                                         # (B, n_embd)
+        out = self.head(cls_out)                                     # (B, action_dim * action_stacking)
+
+        # ----------------------------
+        # 10) Loss (continuous baseline)
+        # ----------------------------
+        loss = None
+        if targets is not None:
+            loss = F.mse_loss(out, targets)
         return (out, loss)
     
     def resize_image(self, image):
@@ -284,7 +432,31 @@ class GRP(nn.Module):
                 raise ValueError("tokenizer and text_model must be provided when using T5 encoding")
             # TODO:    
             ## Provide the logic converting text goal to T5 embedding tensor
-            pass
+            # tokenize with padding/truncation
+            tok = tokenizer(
+                goal,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=self._cfg.max_block_size,
+            )
+            tok = {k: v.to(self._cfg.device) for k, v in tok.items()}
+
+            with _torch.no_grad():
+                enc = text_model.encoder(
+                    input_ids=tok["input_ids"],
+                    attention_mask=tok.get("attention_mask", None),
+                ).last_hidden_state  # (1, T, E_t5)
+
+            # Ensure exactly max_block_size
+            if enc.shape[1] < self._cfg.max_block_size:
+                pad_len = self._cfg.max_block_size - enc.shape[1]
+                pad = _torch.zeros(1, pad_len, enc.shape[2], device=enc.device, dtype=enc.dtype)
+                enc = _torch.cat([enc, pad], dim=1)
+            else:
+                enc = enc[:, :self._cfg.max_block_size, :]
+
+            return enc
         else:
             pad = " " * self._cfg.max_block_size
             goal_ = goal[:self._cfg.max_block_size] + pad[len(goal):self._cfg.max_block_size]
