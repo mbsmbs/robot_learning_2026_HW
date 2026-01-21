@@ -1,0 +1,11 @@
+verify_env.py
+verify_reverb.py
+
+connect.ipynb
+
+outputs/
+
+mini_grp.egg-info/
+
+*.pyc
+*.DS_Store
