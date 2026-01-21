@@ -139,10 +139,67 @@ class GRP(nn.Module):
         cfg.vocab_size = len(chars)
         # TODO: 
         ## Provide the logic for the GRP network
+        # --- basic sizes ---
+        self.n_embd = cfg.n_embd
+        self.dropout = cfg.dropout
+        self.max_block_size = cfg.max_block_size
+
+        # action dimensions
+        self.action_dim = len(cfg.env.action_mean)
+        self.out_dim = self.action_dim * cfg.policy.action_stacking
+
+        # patch embedding sizes (patch vector is p*p*3)
+        patch_dim = cfg.patch_size * cfg.patch_size * 3
+        self.obs_patch_proj = nn.Linear(patch_dim, cfg.n_embd)
+        self.goal_patch_proj = nn.Linear(patch_dim, cfg.n_embd)
+
+        # text embedding (non-T5)
+        self.token_embedding_table = nn.Embedding(cfg.vocab_size, cfg.n_embd)
+
+        # optional projection for T5 embeddings -> n_embd
+        # (LazyLinear figures out input dim from first forward)
+        self.t5_proj = nn.LazyLinear(cfg.n_embd)
+
+        # special tokens
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.n_embd))
+        self.pose_proj = nn.Sequential(
+            nn.Linear(cfg.env.pose_dim, cfg.n_embd),
+            nn.ReLU(),
+            nn.Linear(cfg.n_embd, cfg.n_embd),
+        ) if hasattr(cfg.env, "pose_dim") else None
+
+        # --- positional embeddings ---
+        # compute max sequence length
+        H, W = cfg.image_shape[0], cfg.image_shape[1]
+        n_patches = (H // cfg.patch_size) * (W // cfg.patch_size)
+        obs_tokens = n_patches * cfg.policy.obs_stacking
+        goal_img_tokens = n_patches
+        text_tokens = cfg.max_block_size
+        pose_tokens = 1  # if pose provided at runtime
+
+        # We allocate assuming pose token exists; safe even if pose None
+        self.max_seq_len = 1 + pose_tokens + obs_tokens + text_tokens + goal_img_tokens
+
+        pe = calc_positional_embeddings(self.max_seq_len, cfg.n_embd)  # (L, D)
+        self.pos_embedding = nn.Parameter(pe.unsqueeze(0), requires_grad=False)  # (1, L, D)
+
+        self.drop = nn.Dropout(cfg.dropout)
 
         # 4) Transformer encoder blocks
+        self.blocks = nn.ModuleList([
+            Block(n_embd=cfg.n_embd, n_head=cfg.n_head, dropout=cfg.dropout)
+            for _ in range(cfg.n_layer)
+        ])
+        self.ln_f = nn.LayerNorm(cfg.n_embd)
 
         # 5) Classification MLPk
+        self.head = nn.Sequential(
+            nn.LayerNorm(cfg.n_embd),
+            nn.Linear(cfg.n_embd, self.out_dim),
+        )
+
+        # init
+        self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
