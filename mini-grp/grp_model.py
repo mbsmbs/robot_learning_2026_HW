@@ -5,6 +5,13 @@ from torch.nn import functional as F
 
 
 def get_patches_fast(images, cfg):
+    '''
+    Converts images into a sequence of tokens for the Transformer:
+    1. Slices the image into a grid of small squares (patches).
+    2. Flattens each patch into a 1-dimensional vector (token).
+    3. If there are multiple frames (history), it stacks those patches 
+       into the sequence so the model can see movement over time.
+    '''
     from einops import rearrange
     batch_size, height, width, channels = images.shape
     patch_size = cfg.patch_size ## n_patches = 8
@@ -17,6 +24,12 @@ def get_patches_fast(images, cfg):
 
 
 def calc_positional_embeddings(sequence_length, d):
+    '''
+    Generates a fixed pattern of sine/cosine waves to give the 
+    Transformer a sense of token order and position. 
+    - sequence_length: Number of tokens (patches/words).
+    - d: Dimension of each token's embedding.
+    '''
     result = torch.ones(sequence_length, d)
     for i in range(sequence_length):
         for j in range(d):
@@ -35,17 +48,43 @@ class Head(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
+        '''
+        Executes the attention mechanism:
+        1. Computes scores (wei) to determine how tokens relate to each other.
+        2. Applies a mask to hide specific tokens (important for Multi-modal training).
+        3. Returns a weighted combination of information based on these scores.
+        '''
         B,T,C = x.shape
         # TODO: 
         ## Provide the block masking logic for the attention head
-        k = self.key(x)
-        q = self.query(x)
-        wei = q @ k.transpose(-2,-1) * C**-0.5
-        wei = wei.masked_fill(mask == 0, float('-inf'))
+        k = self.key(x)     # (B, T, hs)
+        q = self.query(x)   # (B, T, hs)
+        wei = q @ k.transpose(-2,-1) * C**-0.5      # (B, T, T)
+
+        # --- Block / token masking logic ---
+        # mask can be:
+        #   - None: no masking
+        #   - (B, T): token keep mask (1 keep, 0 drop)
+        #   - (B, T, T): attention mask (1 allow, 0 block)
+        if mask is not None:
+            if mask.dim() == 2:
+                # token keep mask -> attention mask (block keys that are dropped)
+                # allow attending only to kept tokens
+                attn_mask = mask[:, None, :].expand(B, T, T)    # (B, T, T)
+            elif mask.dim() == 3:
+                attn_mask = mask
+            else :
+                raise ValueError(f"Unsupported mask shape : {mask.shape}")
+            
+            attn_mask = attn_mask.to(dtype=torch.bool)
+            wei = wei.masked_fill(~attn_mask, float('-inf'))
+
+        # wei = wei.masked_fill(mask == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
-        v = self.value(x)
-        out = wei @ v
+        v = self.value(x)       # (B, T, hs)
+        out = wei @ v           # (B, T, hs)
+
         return out
 
 
