@@ -203,7 +203,8 @@ class CircularBuffer:
         goal_ = " " * self._cfg.max_block_size
         goal_ = goal[:self._cfg.max_block_size] + goal_[len(goal):self._cfg.max_block_size] 
         # assert len(goal_) == self._cfg.max_block_size
-        self._dataset_tmp["goal"][self._index] = torch.tensor(self._encode_txt(goal_), dtype=torch.float, device=self._cfg.device)
+        # self._dataset_tmp["goal"][self._index] = torch.tensor(self._encode_txt(goal_), dtype=torch.float, device=self._cfg.device)
+        self._dataset_tmp["goal"][self._index] = torch.tensor(self._encode_txt(goal_), dtype=torch.long, device=self._cfg.device)
         self._count += 1
         self._index = (self._index + 1) % self._size
 
@@ -233,7 +234,8 @@ class CircularBuffer:
             obs_ = transform_crop_scale(obs_).permute(0, 1, 3, 4, 2) # Convert to [B, T, C, H, W] format for torchvision transforms, and back.
             x = self._model.normalize_state(rearrange(obs_, 'b t h w c -> b h w (c t)', c=3, t=cfg.policy.obs_stacking)) ## Rearranging the image to have the stacked history in the last channel dimension)  # Flatten the time dimension for batching
         
-        pose = data["pose"][ix].to(torch.float32).unsqueeze(1) # Convert to [B, T, C]
+        # pose = data["pose"][ix].to(torch.float32).unsqueeze(1) # Convert to [B, T, C]
+        pose = data["pose"][ix].to(torch.float32) # Convert to [B, T, C]
 
         if cfg.dataset.encode_with_t5:
             x_goal = torch.tensor(data["t5_language_embedding"][ix], dtype=torch.float, device=cfg.device)
@@ -249,7 +251,7 @@ class CircularBuffer:
         #     for i in range(1, cfg.policy.action_stacking): ## This is slow but works.
         #         y = torch.concatenate((y, self._model.encode_action(data["action"][ix +cfg.policy.obs_stacking - 1 +i])), axis=1) ## stack on time timension. 
         # return x, pose, x_goal, x_goal_img, y
-        
+
         # ----------------------------
         # Targets y (continuous baseline):
         # predict next action(s) after the last stacked observation frame
