@@ -157,8 +157,22 @@ class GRP(nn.Module):
         self.token_embedding_table = nn.Embedding(cfg.vocab_size, cfg.n_embd)
 
         # optional projection for T5 embeddings -> n_embd
-        # (LazyLinear figures out input dim from first forward)
-        self.t5_proj = nn.LazyLinear(cfg.n_embd)
+        # IMPORTANT: do NOT use LazyLinear here because __init__ calls self.apply(self._init_weights)
+        if cfg.dataset.encode_with_t5:
+            # infer T5 hidden size from version string (covers common cases)
+            t5v = str(cfg.dataset.t5_version).lower()
+            if "small" in t5v:
+                t5_hidden = 512
+            elif "base" in t5v:
+                t5_hidden = 768
+            elif "large" in t5v:
+                t5_hidden = 1024
+            else:
+                # safest default for most assignments here (t5-small)
+                t5_hidden = 512
+            self.t5_proj = nn.Linear(t5_hidden, cfg.n_embd)
+        else:
+            self.t5_proj = None
 
         # special tokens
         self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.n_embd))
@@ -188,11 +202,11 @@ class GRP(nn.Module):
         # 4) Transformer encoder blocks
         self.blocks = nn.ModuleList([
             Block(n_embd=cfg.n_embd, n_head=cfg.n_head, dropout=cfg.dropout)
-            for _ in range(cfg.n_layer)
+            for _ in range(cfg.n_blocks)
         ])
         self.ln_f = nn.LayerNorm(cfg.n_embd)
 
-        # 5) Classification MLPk
+        # 5) Classification MLP
         self.head = nn.Sequential(
             nn.LayerNorm(cfg.n_embd),
             nn.Linear(cfg.n_embd, self.out_dim),
