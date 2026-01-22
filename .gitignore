@@ -4,7 +4,7 @@ verify_reverb.py
 connect.ipynb
 
 outputs/
-
+SimplerEnv/
 mini_grp.egg-info/
 
 *.pyc
