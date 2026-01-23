@@ -203,8 +203,7 @@ class CircularBuffer:
         goal_ = " " * self._cfg.max_block_size
         goal_ = goal[:self._cfg.max_block_size] + goal_[len(goal):self._cfg.max_block_size] 
         # assert len(goal_) == self._cfg.max_block_size
-        # self._dataset_tmp["goal"][self._index] = torch.tensor(self._encode_txt(goal_), dtype=torch.float, device=self._cfg.device)
-        self._dataset_tmp["goal"][self._index] = torch.tensor(self._encode_txt(goal_), dtype=torch.long, device=self._cfg.device)
+        self._dataset_tmp["goal"][self._index] = torch.tensor(self._encode_txt(goal_), dtype=torch.float, device=self._cfg.device)
         self._count += 1
         self._index = (self._index + 1) % self._size
 
@@ -212,12 +211,14 @@ class CircularBuffer:
         # from torchvision import transforms
         from torchvision.transforms import v2 # Recommend v2 for new code
         from einops import rearrange
+
         if self._cfg.policy.use_image_augmentations:
             # TODO:
             ## Add image Augmentations to improve performance
-            # For baseline, keep it simple (no aug).
+            H, W = int(self._cfg.image_shape[0]), int(self._cfg.image_shape[1])
             transform_crop_scale = v2.Compose([
-                v2.ToDtype(torch.float32),
+                v2.RandomResizedCrop(size=(H, W), scale=(0.9, 1.0), ratio=(0.9, 1.1), antialias=True),
+                v2.ToDtype(torch.float32, scale=True),
             ])
         else:
             transform_crop_scale = v2.Compose([
@@ -234,8 +235,7 @@ class CircularBuffer:
             obs_ = transform_crop_scale(obs_).permute(0, 1, 3, 4, 2) # Convert to [B, T, C, H, W] format for torchvision transforms, and back.
             x = self._model.normalize_state(rearrange(obs_, 'b t h w c -> b h w (c t)', c=3, t=cfg.policy.obs_stacking)) ## Rearranging the image to have the stacked history in the last channel dimension)  # Flatten the time dimension for batching
         
-        # pose = data["pose"][ix].to(torch.float32).unsqueeze(1) # Convert to [B, T, C]
-        pose = data["pose"][ix].to(torch.float32) # Convert to [B, T, C]
+        pose = data["pose"][ix].to(torch.float32).unsqueeze(1) # Convert to [B, T, C]
 
         if cfg.dataset.encode_with_t5:
             x_goal = torch.tensor(data["t5_language_embedding"][ix], dtype=torch.float, device=cfg.device)
@@ -246,27 +246,12 @@ class CircularBuffer:
         # TODO: 
         ## Provide the block masking logic for the attention head
         # y = 0 ## discrete or continuous actions
-        # if cfg.policy.action_stacking > 1:
-        #     ## Stack the next cfg.policy.action_stacking actions together
-        #     for i in range(1, cfg.policy.action_stacking): ## This is slow but works.
-        #         y = torch.concatenate((y, self._model.encode_action(data["action"][ix +cfg.policy.obs_stacking - 1 +i])), axis=1) ## stack on time timension. 
-        # return x, pose, x_goal, x_goal_img, y
-
-        # ----------------------------
-        # Targets y (continuous baseline):
-        # predict next action(s) after the last stacked observation frame
-        # ----------------------------
-        base_t = ix + (cfg.policy.obs_stacking - 1)
-
-        y_list = []
-        for k in range(cfg.policy.action_stacking):
-            a = data["action"][base_t + k].to(torch.float32)  # (B, action_dim)
-            a = self._model.encode_action(a)                  # normalize
-            y_list.append(a)
-
-        # (B, action_dim * action_stacking)
-        y = torch.cat(y_list, dim=1)
-
+        y = self._model.encode_action(data["action"][ix + cfg.policy.obs_stacking - 1])
+        
+        if cfg.policy.action_stacking > 1:
+            ## Stack the next cfg.policy.action_stacking actions together
+            for i in range(1, cfg.policy.action_stacking): ## This is slow but works.
+                y = torch.concatenate((y, self._model.encode_action(data["action"][ix +cfg.policy.obs_stacking - 1 +i])), axis=1) ## stack on time timension. 
         return x, pose, x_goal, x_goal_img, y
     
     def shuffle(self, shared_queue):
