@@ -77,10 +77,19 @@ class Head(nn.Module):
                 raise ValueError(f"Unsupported mask shape : {mask.shape}")
             
             attn_mask = attn_mask.to(dtype=torch.bool)
+
+            # Safety: ensure at least one True per row (softmax stability)
+            # Always allow self-attention on the diagonal
+            idx = torch.arange(T, device=x.device)
+            attn_mask = attn_mask.clone()
+            attn_mask[:, idx, idx] = True
+
             wei = wei.masked_fill(~attn_mask, float('-inf'))
 
         # wei = wei.masked_fill(mask == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
+        # Safety: if any NaNs still appear, zero them out (prevents NaN actions)
+        wei = torch.nan_to_num(wei, nan=0.0, posinf=0.0, neginf=0.0)
         wei = self.dropout(wei)
         v = self.value(x)       # (B, T, hs)
         out = wei @ v           # (B, T, hs)
